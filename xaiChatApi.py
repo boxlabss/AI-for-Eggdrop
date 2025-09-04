@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-Flask API for Grok integrating Grok 3 by xAI with DeepSearch for real-time data.
-"""
 
 import os
 import sys
@@ -48,7 +45,7 @@ def load_config():
         # Override xai_api_key with environment variable if set
         config['xai_api_key'] = os.getenv('XAI_API_KEY', config.get('xai_api_key', ''))
         # Validate required fields
-        required_fields = ['xai_api_key', 'api_base_url', 'api_timeout', 'max_tokens', 'temperature', 'max_sources', 'ignore_inputs', 'log_file', 'flask_host', 'flask_port', 'run_startup_test', 'system_prompt']
+        required_fields = ['xai_api_key', 'api_base_url', 'api_timeout', 'max_tokens', 'temperature', 'max_search_results', 'ignore_inputs', 'log_file', 'flask_host', 'flask_port', 'run_startup_test', 'system_prompt']
         missing = [f for f in required_fields if f not in config]
         if missing:
             logger.error(f"Missing config fields: {missing}")
@@ -84,7 +81,7 @@ last_api_success = None
 # Install required dependencies
 def install_dependencies():
     """Install required Python packages if not already installed."""
-    packages = ['flask==2.2.5', 'openai>=1.97.1', 'gunicorn>=20.0']
+    packages = ['flask>=3.0.0', 'openai>=1.0.0', 'gunicorn>=22.0']
     logger.info("Checking dependencies")
     try:
         installed_packages = subprocess.check_output([sys.executable, '-m', 'pip', 'list']).decode('utf-8')
@@ -136,14 +133,14 @@ if not config['xai_api_key']:
 
 # Test API connectivity at startup if enabled
 def test_api_connectivity():
-    """Test connectivity to Grok 3 API and log result."""
+    """Test connectivity to Grok API and log result."""
     global last_api_success
     logger.info("Initializing OpenAI client for connectivity test")
     try:
         client = OpenAI(api_key=config['xai_api_key'], base_url=config['api_base_url'])
         logger.info("OpenAI client started")
         response = client.chat.completions.create(
-            model="grok-3",
+            model="grok-3",  # Use grok-3
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=10,
             timeout=10.0
@@ -163,11 +160,13 @@ else:
     logger.info("Startup API connectivity test disabled in config")
 
 def generate_system_prompt(session_id: str, timestamp: str) -> list:
-    """Generate system prompt for Grok 3 using config template."""
+    """Generate system prompt for Grok using config template."""
     try:
+        current_time = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         prompt = config['system_prompt'].format(
             session_id=session_id,
             timestamp=timestamp,
+            current_time=current_time,
             max_tokens=config['max_tokens'],
             ignore_inputs=', '.join(config['ignore_inputs']),
             message='{message}'
@@ -183,19 +182,19 @@ def generate_system_prompt(session_id: str, timestamp: str) -> list:
         raise
 
 def calculate_time_fallback(query: str, current_time: str) -> str:
-    """Calculate fallback response for time queries if DeepSearch fails."""
+    """Calculate fallback response for time queries if search fails."""
     try:
         current = datetime.fromtimestamp(float(current_time), tz=timezone.utc)
+        is_bst = 'bst' in query.lower() or 'uk' in query.lower()
+        tz_offset = timedelta(hours=1) if is_bst else timedelta(hours=0)
+        tz_name = 'BST' if is_bst else 'UTC'
+        
         if 'yesterday' in query.lower():
             yesterday = current - timedelta(days=1)
-            if 'gmt+1' in query.lower() or 'uk' in query.lower():
-                return yesterday.strftime('Yesterday was %A, %B %d, %Y, in BST (UTC+1).')
-            return yesterday.strftime('Yesterday was %A, %B %d, %Y, in GMT+1.')
-        elif 'time' in query.lower():
-            if 'gmt+1' in query.lower() or 'uk' in query.lower():
-                current_bst = current + timedelta(hours=1)  # UK is on BST in July
-                return current_bst.strftime('It’s %I:%M %p BST on %A, %B %d, %Y.')
-            return current.strftime('It’s %I:%M %p GMT on %A, %B %d, %Y.')
+            return yesterday.strftime(f'Yesterday was %A, %B %d, %Y, in {tz_name}.')
+        elif any(word in query.lower() for word in ['time', 'date', 'today', 'now']):
+            adjusted_time = current + tz_offset
+            return adjusted_time.strftime(f'It’s %I:%M %p {tz_name} on %A, %B %d, %Y.')
         return None
     except Exception as e:
         logger.error(f"Time fallback failed: {type(e).__name__}: {str(e)}")
@@ -206,21 +205,26 @@ def parse_response_date(response: str) -> datetime:
     """Parse date/time from Grok response using regex."""
     try:
         date_patterns = [
-            r'\b(\w+ \d{1,2}, \d{4})\b',  # e.g., July 23, 2025
-            r'\b(\d{4}-\d{2}-\d{2})\b',   # e.g., 2025-07-23
-            r'\b(\d{1,2} \w+ \d{4})\b',   # e.g., 23 July 2025
-            r'\b(\d{1,2}:\d{2} (?:AM|PM))\b'  # e.g., 04:14 AM
+            r'\b(\w+ \d{1,2}, \d{4})\b',  # e.g., September 03, 2025
+            r'\b(\d{4}-\d{2}-\d{2})\b',   # e.g., 2025-09-03
+            r'\b(\d{1,2} \w+ \d{4})\b',   # e.g., 03 September 2025
+            r'\b(\d{1,2}:\d{2} (?:AM|PM)?)\b',  # e.g., 04:14 PM or 04:14
+            r'\b(\d{4})\b'  # e.g., 2023 (fallback for year only)
         ]
         for pattern in date_patterns:
-            match = re.search(pattern, response)
+            match = re.search(pattern, response, re.IGNORECASE)
             if match:
                 date_str = match.group(1)
-                for fmt in ['%B %d, %Y', '%Y-%m-%d', '%d %B %Y', '%I:%M %p']:
+                formats = ['%B %d, %Y', '%Y-%m-%d', '%d %B %Y', '%I:%M %p', '%I:%M', '%Y']
+                for fmt in formats:
                     try:
                         parsed = datetime.strptime(date_str, fmt)
-                        if fmt == '%I:%M %p':
+                        if fmt in ['%I:%M %p', '%I:%M']:
                             current = datetime.now(timezone.utc)
-                            parsed = parsed.replace(year=current.year, month=current.month, day=current.day)
+                            parsed = current.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+                        elif fmt == '%Y':
+                            current = datetime.now(timezone.utc)
+                            parsed = current.replace(year=parsed.year)
                         return parsed.replace(tzinfo=timezone.utc)
                     except ValueError:
                         continue
@@ -232,29 +236,33 @@ def parse_response_date(response: str) -> datetime:
         return None
 
 def process_grok_response(response, message: str, timestamp: str) -> str:
-    """Process Grok 3 API response, applying fallback for invalid time queries."""
+    """Process Grok API response, applying fallback for invalid time queries."""
     reply = response.choices[0].message.content.strip().replace(r'\\n', '\n')
     logger.debug(f"Processing response: {reply}, token_usage={response.usage}")
     
-    if 'time' in message.lower() or 'yesterday' in message.lower():
+    if any(word in message.lower() for word in ['time', 'date', 'today', 'now', 'yesterday']):
         current = datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
         parsed_date = parse_response_date(reply)
         is_valid = False
         if parsed_date:
             time_diff = abs((current - parsed_date).total_seconds())
-            is_valid = time_diff < 24 * 3600  # 24-hour window
+            is_valid = time_diff < 86400  # 24-hour window for time/date queries
             logger.debug(f"Time query validation: parsed_date={parsed_date}, time_diff={time_diff}s, valid={is_valid}, reply={reply}")
         else:
             logger.debug(f"Time query validation: no date parsed, reply={reply}")
         
-        if not reply or 'unavailable' in reply.lower() or not is_valid:
+        if not reply or 'unavailable' in reply.lower() or not is_valid or '2023' in reply:
             fallback = calculate_time_fallback(message, timestamp)
             if fallback:
-                logger.info(f"Used fallback for time query: {fallback}, reason={'no date parsed' if not parsed_date else 'invalid date' if not is_valid else 'empty/unavailable'}")
+                reason = 'no date parsed' if not parsed_date else 'invalid date' if not is_valid else 'empty/unavailable'
+                if '2023' in reply:
+                    reason = 'incorrect year (2023)'
+                logger.info(f"Used fallback for time query: {fallback}, reason={reason}")
                 return fallback
     
     if 'weather' in message.lower() and 'Unable to get real time results' in reply:
         logger.info(f"Weather fallback triggered: {reply}")
+        # Optional: Add custom weather fallback if desired
     
     return reply
 
@@ -289,7 +297,7 @@ def debug():
 
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
-    """Handle IRC chat queries, process with Grok 3, and return responses."""
+    """Handle IRC chat queries, process with Grok, and return responses."""
     start_time = time.time()
     session_id = str(uuid.uuid4())
     timestamp = str(time.time())
@@ -326,9 +334,10 @@ def chat():
         return jsonify({'error': f"Prompt generation failed: {str(e)}", 'fallback': 'Sorry, I couldn\'t process that!'}), 500, {'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'}
 
     search_params = {}
-    if any(keyword in message.lower() for keyword in ['time', 'weather', 'death', 'died', 'recent', 'news', 'what happened']):
-        search_params = {'enable_deep_search': True, 'max_sources': config['max_sources']}
-        logger.info(f"Session ID: {session_id}, Timestamp: {timestamp}, DeepSearch enabled for query: {message}")
+    search_keywords = ['weather', 'death', 'died', 'recent', 'news', 'what happened']  # Removed time-related keywords
+    if any(keyword in message.lower() for keyword in search_keywords):
+        search_params = {'mode': 'on', 'max_search_results': config['max_search_results']}
+        logger.info(f"Session ID: {session_id}, Timestamp: {timestamp}, Live Search enabled for query: {message}")
 
     logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, API request: {json.dumps(conversation, indent=2)}")
 
@@ -346,7 +355,7 @@ def chat():
         }
         logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, Request headers: {headers}")
         response = client.chat.completions.create(
-            model="grok-3",
+            model="grok-3",  # Use grok-3
             messages=conversation,
             temperature=config['temperature'],
             max_tokens=config['max_tokens'],
@@ -358,9 +367,9 @@ def chat():
         global last_api_success
         last_api_success = time.time()
         logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, API call took {api_duration:.2f}s")
-        logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, Raw Grok-3 response: {response.choices[0].message.content}")
+        logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, Raw Grok response: {response.choices[0].message.content}")
         logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, Full response: {response.model_dump()}")
-        logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, DeepSearch sources used: {response.usage.num_sources_used if hasattr(response.usage, 'num_sources_used') else 'None'}")
+        logger.debug(f"Session ID: {session_id}, Timestamp: {timestamp}, Search sources used: {response.usage.num_sources_used if hasattr(response.usage, 'num_sources_used') else 'None'}")
 
         reply = process_grok_response(response, message, timestamp)
         reply_hash = hashlib.sha256(reply.encode()).hexdigest()
@@ -371,7 +380,7 @@ def chat():
     except (APIError, APIConnectionError, Timeout) as e:
         logger.error(f"Session ID: {session_id}, Timestamp: {timestamp}, API call failed: {type(e).__name__}: {str(e)}")
         logger.debug(f"Stack trace: {traceback.format_exc()}")
-        if 'time' in message.lower() or 'yesterday' in message.lower():
+        if any(word in message.lower() for word in ['time', 'date', 'today', 'now', 'yesterday']):
             fallback = calculate_time_fallback(message, timestamp)
             if fallback:
                 logger.info(f"Session ID: {session_id}, Timestamp: {timestamp}, Used fallback for time query: {fallback}, reason=API failure")

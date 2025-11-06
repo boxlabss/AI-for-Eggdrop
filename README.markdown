@@ -16,7 +16,7 @@ source ~/xai_env/bin/activate
 ### 3. Install Python Dependencies
 Install required Python packages for `XaiChatApi.py`.
 ```bash
-pip install flask==3.1.1 openai==1.97.1 gunicorn==23.0.0
+./install_dependencies.py
 ```
 Verify installation:
 ```bash
